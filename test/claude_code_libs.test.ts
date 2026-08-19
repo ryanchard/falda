@@ -202,9 +202,14 @@ describe("cc plugin: credential resolution", () => {
 });
 
 describe("cc plugin: feature flags", () => {
-  test("all features default on", () => {
+  test("all features default on, except captureTools (opt-in)", () => {
     const f = creds.features({});
-    assert.deepEqual(f, { capture: true, autoRecall: true, distillOnCompact: true, recallOnCompact: true });
+    assert.deepEqual(f, {
+      capture: true, autoRecall: true, distillOnCompact: true, recallOnCompact: true,
+      // Unlike the others, captureTools must be explicitly requested — see
+      // the dedicated tests below.
+      captureTools: false,
+    });
   });
 
   test("only the exact string '0' disables a feature", () => {
@@ -216,6 +221,18 @@ describe("cc plugin: feature flags", () => {
   test("recallOnCompact is forced off when capture is off", () => {
     const f = creds.features({ FALDA_CAPTURE: "0", FALDA_RECALL_ON_COMPACT: "1" });
     assert.equal(f.recallOnCompact, false, "post-compaction recall needs capture writing to T0");
+  });
+
+  test("captureTools requires the exact string '1', unlike the other flags", () => {
+    assert.equal(creds.features({ FALDA_CAPTURE_TOOLS: "1" }).captureTools, true);
+    assert.equal(creds.features({ FALDA_CAPTURE_TOOLS: "true" }).captureTools, false);
+    assert.equal(creds.features({ FALDA_CAPTURE_TOOLS: "" }).captureTools, false);
+    assert.equal(creds.features({}).captureTools, false);
+  });
+
+  test("captureTools is forced off when capture is off, even if requested", () => {
+    const f = creds.features({ FALDA_CAPTURE: "0", FALDA_CAPTURE_TOOLS: "1" });
+    assert.equal(f.captureTools, false, "tool rows without prose rows is not a coherent state");
   });
 });
 

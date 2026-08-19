@@ -88,6 +88,13 @@ function streamCount(sessionId: string): number {
   return store.queryStream({ session_id: sessionId }).total;
 }
 
+/** Read back T0 rows for a session (role + content), newest last. */
+function streamRows(sessionId: string): Array<{ role: string; content: string }> {
+  const store = handle.runtime.pools.resolve("ccproj", undefined, false);
+  return store.queryStream({ session_id: sessionId }).messages
+    .map((m: any) => ({ role: m.role, content: m.content }));
+}
+
 describe("cc plugin: stateless MCP contract", () => {
   test("a bare tools/call succeeds with no initialize and no Mcp-Session-Id", async () => {
     // This is the assumption the dependency-free client rests on. Asserted
@@ -523,5 +530,111 @@ describe("cc plugin: distill on compaction", () => {
     // coverage is the first test above (enqueues a job).
     const r = await runHook("distill", { session_id: "sess-dis-3" }, { ...env, FALDA_MCP_URL: "http://127.0.0.1:1/mcp" });
     assert.equal(r.code, 0, "exit 2 would block compaction");
+  });
+});
+
+describe("cc plugin: tool capture", () => {
+  test("is off unless FALDA_CAPTURE_TOOLS is exactly 1", async () => {
+    const sid = "sess-tool-off";
+    const r = await runHook("capture-tool", {
+      session_id: sid, tool_name: "Bash",
+      tool_input: { command: "echo hi" }, tool_response: { stdout: "hi" },
+      tool_use_id: "tu-off-1",
+    }, { ...env, FALDA_CAPTURE_TOOLS: "" });
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "");
+    assert.equal(streamCount(sid), 0, "opt-in: nothing captured without the flag");
+  });
+
+  test("is forced off when FALDA_CAPTURE=0", async () => {
+    const sid = "sess-tool-forced-off";
+    await runHook("capture-tool", {
+      session_id: sid, tool_name: "Bash",
+      tool_input: { command: "echo hi" }, tool_response: { stdout: "hi" },
+      tool_use_id: "tu-forced-1",
+    }, { ...env, FALDA_CAPTURE: "0", FALDA_CAPTURE_TOOLS: "1" });
+    assert.equal(streamCount(sid), 0, "tool rows without prose rows is not a coherent state");
+  });
+
+  test("captures a tool result under a tool:<Name> role with the command echoed", async () => {
+    const sid = "sess-tool-on";
+    const r = await runHook("capture-tool", {
+      session_id: sid, tool_name: "Bash",
+      tool_input: { command: "psql -c '\\d users'" },
+      tool_response: { stdout: "id | integer\nemail | text", interrupted: false },
+      tool_use_id: "tu-on-1",
+    }, { ...env, FALDA_CAPTURE_TOOLS: "1" });
+
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "", "capture hooks never write to stdout");
+    const rows = streamRows(sid);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].role, "tool:Bash");
+    assert.ok(rows[0].content.startsWith("$ Bash "), `got: ${rows[0].content.slice(0, 40)}`);
+    assert.ok(rows[0].content.includes("psql"), "tool_input echoed for provenance");
+    assert.ok(rows[0].content.includes("email | text"), "object tool_response serialized, not [object Object]");
+  });
+
+  test("replaying the same tool_use_id is a no-op", async () => {
+    const sid = "sess-tool-idem";
+    const input = {
+      session_id: sid, tool_name: "Read",
+      tool_input: { file_path: "/etc/hosts" }, tool_response: "127.0.0.1 localhost",
+      tool_use_id: "tu-idem-1",
+    };
+    const e = { ...env, FALDA_CAPTURE_TOOLS: "1" };
+    await runHook("capture-tool", input, e);
+    await runHook("capture-tool", input, e);
+    assert.equal(streamCount(sid), 1, "server-side turn_id idempotency");
+  });
+
+  test("truncates an oversized result and marks the elision", async () => {
+    const sid = "sess-tool-big";
+    await runHook("capture-tool", {
+      session_id: sid, tool_name: "Bash",
+      tool_input: { command: "cat big.log" },
+      tool_response: "S".repeat(400) + "E".repeat(400),
+      tool_use_id: "tu-big-1",
+    }, { ...env, FALDA_CAPTURE_TOOLS: "1", FALDA_CAPTURE_TOOL_MAX_CHARS: "100" });
+
+    const body = streamRows(sid)[0].content;
+    assert.ok(body.includes("chars elided"), "elision marker present");
+    assert.ok(body.includes("S".repeat(75)), "head retained");
+    assert.ok(body.trimEnd().endsWith("E".repeat(25)), "tail retained");
+  });
+
+  test("captures a tool failure, which carries the error", async () => {
+    const sid = "sess-tool-fail";
+    await runHook("capture-tool", {
+      session_id: sid, tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      error: "1 failing: expected 200, got 503",
+      tool_use_id: "tu-fail-1",
+    }, { ...env, FALDA_CAPTURE_TOOLS: "1" });
+
+    const rows = streamRows(sid);
+    assert.equal(rows.length, 1);
+    assert.ok(rows[0].content.includes("ERROR:"), "failures are labelled");
+    assert.ok(rows[0].content.includes("got 503"));
+  });
+
+  test("skips a user interrupt, which is not a fact", async () => {
+    const sid = "sess-tool-interrupt";
+    await runHook("capture-tool", {
+      session_id: sid, tool_name: "Bash",
+      tool_input: { command: "sleep 300" },
+      error: "interrupted", is_interrupt: true, tool_use_id: "tu-int-1",
+    }, { ...env, FALDA_CAPTURE_TOOLS: "1" });
+    assert.equal(streamCount(sid), 0);
+  });
+
+  test("exits 0 and stays silent with no tool_name or no payload", async () => {
+    const e = { ...env, FALDA_CAPTURE_TOOLS: "1" };
+    const a = await runHook("capture-tool", { session_id: "sess-tool-empty", tool_use_id: "tu-e1" }, e);
+    const b = await runHook("capture-tool", { session_id: "sess-tool-empty", tool_name: "Bash", tool_use_id: "tu-e2" }, e);
+    assert.equal(a.code, 0);
+    assert.equal(b.code, 0);
+    assert.equal(a.stdout + b.stdout, "");
+    assert.equal(streamCount("sess-tool-empty"), 0);
   });
 });
