@@ -466,6 +466,7 @@ anything. Thresholds are configurable per deployment without a rebuild:
 | `FALDA_INSPECT_WARN_RAPID_SUPERSESSION_MINUTES` | `60` | an atom updated/merged away within this many minutes of its own creation warns |
 | `FALDA_INSPECT_WARN_SCENE_CHURN_FRACTION` | `0.5` | scene membership `(added+removed)/max(before,after)` above this warns |
 | `FALDA_INSPECT_WARN_CORE_CHURN_FRACTION` | `0.5` | core char-count relative change above this warns |
+| `FALDA_DISTILL_WINDOW_MAX_CHARS` | `60000` | Character ceiling on the L1 extraction window. Bounds what reaches the LLM regardless of row count, so one oversized stream row cannot fail a whole pass. The window is trimmed from the tail; trimmed turns are processed by the next pass, never skipped. |
 
 ## Fixture export — turning a bad decision into a regression test
 

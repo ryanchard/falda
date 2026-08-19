@@ -32,6 +32,9 @@ export interface LLMFn {
 export interface DistillOptions {
   storeKey?: string;
   windowSize?: number;
+  /** Character ceiling on the extraction window (FALDA_DISTILL_WINDOW_MAX_CHARS).
+   *  Distinct from windowSize, which caps the row COUNT. */
+  windowMaxChars?: number;
   candidateLimit?: number;
   /** Cosine-similarity threshold for assigning an atom to a topic cluster.
    *  Controls how similar an atom must be to a cluster's founding centroid
@@ -73,6 +76,35 @@ const DEFAULT_SCENE_MATCH_THRESHOLD = 0.5;
 const DEFAULT_SCENE_REORG_THRESHOLD = 0.7;
 const DEFAULT_CONSOLIDATION_BATCH = 20;
 const DEFAULT_CONSOLIDATION_MAX_CHARS = 0;
+const DEFAULT_WINDOW_MAX_CHARS = 60000;
+
+/** Character ceiling on the L1 extraction window. Unlike windowSize (a row
+ *  count), this bounds what actually reaches the LLM: one 300KB tool-output
+ *  row would otherwise fail the extraction call and abort the whole pass. */
+function windowMaxChars(): number {
+  const raw = Number(process.env.FALDA_DISTILL_WINDOW_MAX_CHARS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_WINDOW_MAX_CHARS;
+}
+
+/** Trim a seq-ordered turn window to a character budget, always keeping at
+ *  least one turn so an oversized row can never deadlock a pass.
+ *
+ *  Trims from the TAIL, so the result stays a contiguous prefix of the
+ *  fetched rows. That is what makes the watermark safe: it is derived from
+ *  the last retained turn, so the dropped remainder has a strictly greater
+ *  seq and is picked up by the next pass rather than skipped. */
+export function trimWindowToBudget<T extends { content: string }>(turns: T[], maxChars: number): T[] {
+  if (turns.length === 0) return turns;
+  const out: T[] = [];
+  let used = 0;
+  for (const t of turns) {
+    const cost = t.content.length;
+    if (out.length > 0 && used + cost > maxChars) break;
+    out.push(t);
+    used += cost;
+  }
+  return out;
+}
 
 /** Candidates per batched consolidation call. 1 restores the historical
  *  one-call-per-candidate behaviour. Chunking is not optional: the extraction
@@ -628,7 +660,15 @@ export async function distillOnce(
   const wm = getWatermark(db, storeKey);
   const afterSeq = wm?.last_processed_seq ?? null;
 
-  const turns = store.queryStreamSeq({ afterSeq: afterSeq ?? 0, limit: windowSize });
+  // Trim HERE, before lastTurn/pid/turns_processed/recordPassStart are all
+  // derived from `turns` below — so every one of them describes the window
+  // actually sent to the LLM, and setWatermark needs no separate guard.
+  const fetched = store.queryStreamSeq({ afterSeq: afterSeq ?? 0, limit: windowSize });
+  const budget = opts.windowMaxChars ?? windowMaxChars();
+  const turns = trimWindowToBudget(fetched, budget);
+  if (turns.length < fetched.length) {
+    log(`[distill] window trimmed ${fetched.length} -> ${turns.length} turns (budget ${budget} chars)`);
+  }
 
   // A store is truly a no-op only when there are no new turns to extract AND
   // nothing has flagged it dirty (docs/future/reliability-hardening.md
