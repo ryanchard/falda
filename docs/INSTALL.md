@@ -161,6 +161,7 @@ const hits = await mem.recall("kukla", "what should I remember?");
 | `FALDA_EMBED_BASE_URL` | _(unset)_ | OpenAI-compatible `/v1/embeddings` base URL |
 | `FALDA_EMBED_API_KEY` | _(unset)_ | API key for the embedder, if required |
 | `FALDA_EMBED_MODEL` | `nomic-embed-text` | Embedding model id (`Xenova/bge-base-en-v1.5` when `FALDA_EMBED=onnx`) |
+| `FALDA_EMBED_MAX_CHARS` | `2048` | characters of a stream row sent to the embedder. Full content is always stored and FTS-indexed; this bounds only the vector. Applies to `addStream` and `falda reembed` alike, so both produce comparable vectors |
 | `FALDA_EMBED_STRICT` | _(unset)_ | `1` turns an unconfigured embedder (no `FALDA_EMBED`/`FALDA_EMBED_BASE_URL`) into a startup `FATAL` instead of the silent local-embedder fallback below — opt in for production |
 | `FALDA_DISTILL_CONSOLIDATION_BATCH` | `20` | candidates decided per consolidation call. Distillation decides them in batches of this size instead of one call each — an estimated ~47% fewer input tokens at 15 candidates. `1` restores one call per candidate |
 | `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS` | *(disabled)* | approximate char cap (~4 chars/token heuristic, not an exact token count) on one batched consolidation call's built prompt; over-cap chunks are adaptively split smaller (down to one candidate, sent alone if it alone still exceeds the cap). Disabled (`0`) by default; set a positive value if large `FALDA_DISTILL_CONSOLIDATION_BATCH` values risk exceeding your model's input window |

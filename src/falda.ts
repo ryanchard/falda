@@ -172,6 +172,26 @@ export class AtomTypeError extends Error {
   constructor(msg: string) { super(msg); this.name = "AtomTypeError"; }
 }
 
+// ─── Embedder input bound ──────────────────────────────────────────────────────
+
+const DEFAULT_EMBED_MAX_CHARS = 2048;
+
+/** Bound what reaches the embedder.
+ *
+ *  Not a behaviour change for prose: BGE's window is 512 tokens, so any long
+ *  row was already embedded as roughly its first paragraph. This makes that
+ *  explicit and stops the remote embedder path shipping multi-KB payloads
+ *  per row. Full content is still stored and FTS-indexed — FTS, not the
+ *  vector index, is the retrieval path for large rows. */
+export function embedInput(text: string, maxChars = embedMaxChars()): string {
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+function embedMaxChars(): number {
+  const raw = Number(process.env.FALDA_EMBED_MAX_CHARS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EMBED_MAX_CHARS;
+}
+
 // ─── FTS sanitizer ─────────────────────────────────────────────────────────────
 
 function toFtsQuery(raw: string): string {
@@ -547,7 +567,7 @@ export class Falda {
 
       ins.run(id, sessionId, m.role, m.content, ts, turnIndex, turnId);
       insF.run(m.content, id);
-      insV.run(id, this.vecBuf(await this.embed(m.content)));
+      insV.run(id, this.vecBuf(await this.embed(embedInput(m.content))));
       ids.push(id);
     }
     return ids;
@@ -1275,7 +1295,7 @@ export class Falda {
     const turns = this.db.prepare("SELECT id, content FROM stream").all() as Array<{ id: string; content: string }>;
     const insT = this.db.prepare("INSERT INTO stream_vec(id,embedding) VALUES(?,?)");
     for (let i = 0; i < turns.length; i++) {
-      insT.run(turns[i].id, this.vecBuf(await this.embed(turns[i].content)));
+      insT.run(turns[i].id, this.vecBuf(await this.embed(embedInput(turns[i].content))));
       onProgress?.("stream", i + 1, turns.length);
     }
 
