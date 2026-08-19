@@ -14,6 +14,22 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Falda, embedInput } from "../src/falda.js";
 
+/** Run `fn` with FALDA_EMBED_MAX_CHARS unset, then restore it.
+ *  Both assertions on the 2048 DEFAULT read process.env at call time, so
+ *  without this they fail for any developer (or measurement run — see
+ *  docs/future/tool-output-capture-measurement.md, which pins this variable)
+ *  that has it exported. */
+async function withoutEmbedMaxChars<T>(fn: () => T | Promise<T>): Promise<T> {
+  const saved = process.env.FALDA_EMBED_MAX_CHARS;
+  delete process.env.FALDA_EMBED_MAX_CHARS;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.FALDA_EMBED_MAX_CHARS;
+    else process.env.FALDA_EMBED_MAX_CHARS = saved;
+  }
+}
+
 function makeStore(dim = 32, embed?: (t: string) => Promise<number[]>) {
   const blobDir = fs.mkdtempSync(path.join(os.tmpdir(), "falda-embedbound-"));
   const fallback = async (t: string) => new Array(dim).fill(t.length / 100000);
@@ -30,8 +46,10 @@ describe("embedInput", () => {
     assert.equal(embedInput("a".repeat(5000), 2048).length, 2048);
   });
 
-  test("defaults to 2048 characters", () => {
-    assert.equal(embedInput("a".repeat(5000)).length, 2048);
+  test("defaults to 2048 characters", async () => {
+    await withoutEmbedMaxChars(() => {
+      assert.equal(embedInput("a".repeat(5000)).length, 2048);
+    });
   });
 });
 
@@ -40,18 +58,20 @@ describe("addStream embedding bounds", () => {
     const seen: string[] = [];
     const { s, blobDir } = makeStore(32, async (t) => { seen.push(t); return new Array(32).fill(0.1); });
     try {
-      const marker = "NEEDLE_AT_THE_END_9f3a";
-      const content = "q".repeat(5000) + marker;
-      await s.addStream("sess-e", [{ role: "tool:Bash", content }]);
+      await withoutEmbedMaxChars(async () => {
+        const marker = "NEEDLE_AT_THE_END_9f3a";
+        const content = "q".repeat(5000) + marker;
+        await s.addStream("sess-e", [{ role: "tool:Bash", content }]);
 
-      assert.equal(seen.length, 1, "one embed call");
-      assert.equal(seen[0].length, 2048, "embedder saw a bounded excerpt");
+        assert.equal(seen.length, 1, "one embed call");
+        assert.equal(seen[0].length, 2048, "embedder saw a bounded excerpt");
 
-      const { messages } = s.queryStream({ session_id: "sess-e" });
-      assert.equal(messages[0].content, content, "full content is stored verbatim");
+        const { messages } = s.queryStream({ session_id: "sess-e" });
+        assert.equal(messages[0].content, content, "full content is stored verbatim");
 
-      const hits = await s.searchStream(marker, 5);
-      assert.ok(hits.length > 0, "FTS finds a term beyond the embedding excerpt");
+        const hits = await s.searchStream(marker, 5);
+        assert.ok(hits.length > 0, "FTS finds a term beyond the embedding excerpt");
+      });
     } finally { s.close(); fs.rmSync(blobDir, { recursive: true, force: true }); }
   });
 });

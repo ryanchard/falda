@@ -60,13 +60,65 @@ appears in prose, the control arm can also recall it and the trial is void.
    variable is the flag.
 3. Continue until at least one compaction boundary has passed.
 4. Wait for distillation to finish before probing — recall reads distilled
-   tiers, not raw T0. Do not assume a pass has finished because the session
-   ended; confirm it:
-   - `falda stats --tenant=<arm> --section=queue --json` — wait until
-     `by_status.pending` and `by_status.running` are both `0` for the
-     store's jobs.
-   - `falda distill inspect --tenant=<arm> --status=running --json` —
-     confirm it returns no passes.
+   tiers, not raw T0. "Finished" means **the distillation watermark has
+   reached the head of the stream**, not "the queue is empty".
+
+   Do not use an empty queue as the criterion. The queue is empty for most
+   of every sweep interval even when thousands of turns are undistilled —
+   the worker enqueues one passive job per store per `FALDA_SWEEP_INTERVAL_MS`
+   (default 5 min) and each job distills at most one window
+   (`DEFAULT_WINDOW_SIZE = 20` turns, `src/distill/core.ts`), so
+   `pending == running == 0` means "no job right this second", not "T0 is
+   drained". That check also biases the experiment: the treatment arm has
+   roughly ten times the rows, so it is far likelier to be probed
+   mid-backlog, which manufactures exactly the "tool capture didn't help"
+   result this experiment exists to test.
+
+   **Criterion.** Two numbers must be equal, per arm:
+
+   ```
+   falda stats --tenant=<arm> --section=stores --json
+   #   .stores[0].stream_head_seq        -> head of T0 (MAX(seq) in `stream`)
+
+   falda distill inspect --tenant=<arm> --status=done --last=1 --json
+   #   .passes[0].watermark_end          -> last seq the newest COMPLETED pass covered
+   ```
+
+   When `watermark_end == stream_head_seq`, every T0 turn has been through
+   L1 and the arm is ready to probe. `--status=done` is load-bearing:
+   `watermark_end` is stamped at pass *start*, and a failed pass does not
+   advance the persisted watermark, so the newest pass of any status can
+   overstate progress. An empty `passes[]` means nothing has ever been
+   distilled for that tenant.
+
+   Equivalently, straight from the store — this reads the persisted
+   watermark rather than inferring it from pass history, and is the check
+   to prefer if the two ever disagree:
+
+   ```sh
+   sqlite3 "$FALDA_ROOT/tenants/<arm>/self/falda.db" \
+     "SELECT (SELECT MAX(seq) FROM stream) AS head,
+             (SELECT last_processed_seq FROM distill_watermark
+               WHERE store_key = '<arm>:self') AS watermark;"
+   ```
+
+   Both columns come from `docs/schema/tables.sql`: `stream.seq` is the
+   store-global turn order, and `distill_watermark.last_processed_seq` is
+   the seq of the last turn L1 actually processed (`src/distill/watermark.ts`).
+   `store_key` for a tenant's own store is `<tenant>:self`
+   (`storeKeyFor`, `src/distill/queue.ts`). A NULL watermark means no pass
+   has ever completed for that store.
+
+   If the gap is not closing, that is expected rather than broken: at the
+   defaults a store drains at roughly 20 turns per 5 minutes, and less when
+   rows are large enough for `FALDA_DISTILL_WINDOW_MAX_CHARS` to trim the
+   window. Either wait it out, or lower `FALDA_SWEEP_INTERVAL_MS` and
+   `FALDA_DRAIN_INTERVAL_MS` for the duration of the run — identically in
+   both arms, since they are part of the pinned configuration.
+
+   As a secondary sanity check, `falda distill inspect --tenant=<arm>
+   --status=running --json` should return no passes, confirming nothing is
+   mid-flight when you take the reading.
 5. Probe from a **new session**: in-context compression cannot carry
    information across a session boundary, so a same-session probe would
    mask the effect being measured. If a probe comes back negative,

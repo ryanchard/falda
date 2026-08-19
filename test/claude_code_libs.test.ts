@@ -437,6 +437,14 @@ describe("cc plugin: payload serialization", () => {
     assert.equal(payload.stringifyPayload(undefined), "");
   });
 
+  test("returns a string for values JSON.stringify maps to undefined", () => {
+    // JSON.stringify(fn) and JSON.stringify(Symbol()) are undefined, not "".
+    // The declared contract is "always a string" and the caller does
+    // body.trim(), which would throw on undefined.
+    assert.equal(typeof payload.stringifyPayload(() => 1), "string");
+    assert.equal(typeof payload.stringifyPayload(Symbol("s")), "string");
+  });
+
   test("survives a circular object without throwing", () => {
     const a: any = { name: "loop" };
     a.self = a;

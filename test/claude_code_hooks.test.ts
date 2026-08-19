@@ -618,6 +618,44 @@ describe("cc plugin: tool capture", () => {
     assert.ok(rows[0].content.includes("got 503"));
   });
 
+  test("success and failure use distinct turn_id namespaces", async () => {
+    // The shipped binary emits exactly one of PostToolUse /
+    // PostToolUseFailure per call, so this pair cannot occur today. It is
+    // asserted anyway because the failure mode if it ever did is silent:
+    // src/falda.ts's turn_id dedup drops a repeat WITHOUT comparing
+    // content, so a shared namespace would discard the error row.
+    const sid = "sess-tool-ns";
+    const e = { ...env, FALDA_CAPTURE_TOOLS: "1" };
+    const base = { session_id: sid, tool_name: "Bash", tool_input: { command: "npm test" }, tool_use_id: "tu-ns-1" };
+    await runHook("capture-tool", { ...base, tool_response: { stdout: "3 passing" } }, e);
+    await runHook("capture-tool", { ...base, error: "1 failing: expected 200, got 503" }, e);
+
+    const rows = streamRows(sid);
+    assert.equal(rows.length, 2, "cc-<id>-tool and cc-<id>-toolerr must not collide");
+    assert.ok(rows.some((r) => r.content.includes("3 passing")), "success row kept");
+    assert.ok(rows.some((r) => r.content.includes("ERROR:")), "failure row kept");
+  });
+
+  test("never captures FALDA's own MCP tool calls", async () => {
+    // A recall response captured into T0 is re-distilled as fresh evidence,
+    // so recalled atoms reinforce themselves and any A/B measurement is
+    // contaminated by the capture mechanism's own output.
+    const sid = "sess-tool-selfcap";
+    const e = { ...env, FALDA_CAPTURE_TOOLS: "1" };
+    await runHook("capture-tool", {
+      session_id: sid, tool_name: "mcp__plugin_falda-memory_falda__falda_recall",
+      tool_input: { query: "deploy script" },
+      tool_response: { context: "The deploy script lives in bin/release" },
+      tool_use_id: "tu-self-1",
+    }, e);
+    await runHook("capture-tool", {
+      session_id: sid, tool_name: "mcp__falda__falda_stream_add",
+      tool_input: { session_id: "x" }, tool_response: { added: 1 },
+      tool_use_id: "tu-self-2",
+    }, e);
+    assert.equal(streamCount(sid), 0, "FALDA's own tool output must not re-enter T0");
+  });
+
   test("skips a user interrupt, which is not a fact", async () => {
     const sid = "sess-tool-interrupt";
     await runHook("capture-tool", {

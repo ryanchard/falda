@@ -27,6 +27,22 @@ function cleanup(s: Falda, blobDir: string) {
   fs.rmSync(blobDir, { recursive: true, force: true });
 }
 
+/** Run `fn` with FALDA_DISTILL_WINDOW_MAX_CHARS unset, then restore it.
+ *  distillOnce falls back to process.env when opts.windowMaxChars is
+ *  omitted, so the DEFAULT-budget assertion below would fail for any
+ *  developer (or measurement run — docs/future/tool-output-capture-measurement.md
+ *  pins this variable) that has it exported. */
+async function withoutWindowMaxChars<T>(fn: () => T | Promise<T>): Promise<T> {
+  const saved = process.env.FALDA_DISTILL_WINDOW_MAX_CHARS;
+  delete process.env.FALDA_DISTILL_WINDOW_MAX_CHARS;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.FALDA_DISTILL_WINDOW_MAX_CHARS;
+    else process.env.FALDA_DISTILL_WINDOW_MAX_CHARS = saved;
+  }
+}
+
 describe("trimWindowToBudget", () => {
   test("returns an empty window unchanged", () => {
     assert.deepEqual(trimWindowToBudget([], 100), []);
@@ -99,7 +115,8 @@ describe("distillOnce window budget", () => {
         { role: "user", content: "The deploy script lives in bin/release" },
         { role: "assistant", content: "Noted." },
       ]);
-      const r = await distillOnce(s, makeQuietLLM(), { storeKey: "test:self", verbose: false });
+      const r = await withoutWindowMaxChars(() =>
+        distillOnce(s, makeQuietLLM(), { storeKey: "test:self", verbose: false }));
       assert.equal(r.turns_processed, 2, "no trimming at the 60000-char default");
     } finally { cleanup(s, blobDir); }
   });

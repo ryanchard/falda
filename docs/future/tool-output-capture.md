@@ -2,7 +2,7 @@
 
 **Status:** proposed — local measurement branch, not yet for upstream.
 **Date:** 2026-08-20
-**Scope:** `integrations/claude-code`, `src/distill/core.ts`, `src/falda.ts`, `src/embedder.ts`
+**Scope:** `integrations/claude-code`, `src/distill/core.ts`, `src/falda.ts`
 
 ## Problem
 
@@ -91,9 +91,21 @@ arbitrarily large and is already visible in the resulting file.
 
 - **`role`**: `tool:<ToolName>` (e.g. `tool:Bash`, `tool:Read`). Renders as
   `tool:Bash: …` through the existing extraction prompt.
-- **`turn_id`**: `cc-<tool_use_id>-tool`. `tool_use_id` is always present
-  and unique, so this is a sound idempotency key — the missing-`prompt_id`
-  hazard documented at `falda-hook.mjs:44` does not apply.
+- **`turn_id`**: `cc-<tool_use_id>-tool` on the `PostToolUse` path and
+  `cc-<tool_use_id>-toolerr` on the `PostToolUseFailure` path.
+  `tool_use_id` is always present and unique, so this is a sound
+  idempotency key — the missing-`prompt_id` hazard documented at
+  `falda-hook.mjs:44` does not apply.
+
+  The two paths get **separate namespaces** even though the shipped binary
+  emits exactly one of the two events per tool call, which would make a
+  single shared namespace collision-free today. That is a property of the
+  harness, not a contract this integration controls. If it ever emitted
+  both — a retry, a partial result followed by an error — the second
+  arrival would be a `turn_id` repeat, and `src/falda.ts`'s dedup discards
+  a repeated `turn_id` WITHOUT comparing content: the error message, the
+  higher-value half, would be lost silently. Splitting the namespaces costs
+  nothing and removes the failure mode.
 - **`tool_response` serialization**: most tools return an object
   (`{stdout, stderr, interrupted}` for Bash), so the value is JSON-stringified
   when it is not already a string, before the size check.
@@ -114,6 +126,17 @@ Head and tail are the fact-bearing regions — headers, schemas and commands
 at the top; results, errors and exit status at the bottom. The elision
 marker is load-bearing: it tells distillation the row is partial, so the
 extraction LLM does not state a confident fact drawn from a severed table.
+
+**FALDA's own tools are excluded.** The hook skips any tool whose name
+matches `/falda/i` before doing anything else. `hooks.json` registers
+`capture-tool` with no matcher, so without this every `falda_recall`,
+`falda_remember` and `falda_stream_add` call would be captured — and a
+captured `falda_recall` response is already-distilled memory re-entering T0
+to be re-distilled as fresh evidence, so atoms reinforce themselves and
+duplicate on every session. It would also corrupt §7: the treatment arm
+would be measuring its own output. The match is deliberately loose because
+the MCP tool prefix depends on installation shape (`mcp__falda__…` when
+configured directly, `mcp__plugin_falda-memory_falda__…` via the plugin).
 
 **No summarization at capture time.** `PostToolUse` spawns a process per
 tool call and must never stall a turn; an LLM call there is the wrong
@@ -168,14 +191,36 @@ by the next pass rather than dropped. No change is needed to the sweep
 worker for this: the watermark not having reached the newest turn is
 already the condition that makes the next pass do work.
 
+### Ordering within a window
+
+`PostToolUse` hooks run `async`, as separate concurrent processes, so the
+`seq` a tool row receives reflects when its `falda_stream_add` reached the
+server — arrival order, which is only approximately conversation order. An
+extraction window can therefore show a tool row *after* the assistant text
+that summarizes it, or two rows from a parallel tool batch in either order.
+Extraction reads the window as a set of evidence turns rather than a strict
+transcript, so this is a fidelity caveat rather than a correctness bug — but
+it is worth knowing before reading a window and concluding the hook fired in
+the wrong order.
+
 ## 5. Embedding
 
-`addStream` embeds every row synchronously inside the insert loop
-(`src/falda.ts:872`), and no embedder path truncates its input — the ONNX
-path passes raw text straight to `extractor(text, {pooling:"cls",
-normalize:true})` (`src/embedder.ts:195`).
+`addStream` embeds every row synchronously inside the insert loop, and no
+embedder path truncates its input — the ONNX path passes raw text straight
+to `extractor(text, {pooling:"cls", normalize:true})` (`src/embedder.ts`).
 
-The embed input becomes a bounded excerpt of `FALDA_EMBED_MAX_CHARS`.
+**What shipped:** the bound lives in `src/falda.ts`, not in
+`src/embedder.ts`. An exported `embedInput(text, maxChars =
+FALDA_EMBED_MAX_CHARS)` truncates to a bounded excerpt, and it is applied at
+exactly the two places that embed a **stream row**: the `addStream` insert
+loop, and the stream leg of the re-embed backfill. `src/embedder.ts` is
+unchanged on this branch.
+
+That is narrower than "bound the embedder" and deliberately so. Stream rows
+are the only class this feature makes large; atom and scene embeddings are
+generated text of bounded size, and silently truncating them would change
+retrieval behaviour for every existing caller in exchange for nothing. A
+bound inside the embedder would have applied to all three.
 
 Being precise about what this buys: BGE's window is 512 tokens, so current
 behaviour on any long row is already "embed roughly the first paragraph."
@@ -200,6 +245,9 @@ Extending `test/claude_code_hooks.test.ts`:
 - `PostToolUseFailure` produces a row carrying the error
 - `turn_id` derives from `tool_use_id`; a replayed identical event is a
   no-op rather than a duplicate row
+- a success and a failure sharing one `tool_use_id` produce two rows, not
+  one — the split `-tool` / `-toolerr` namespaces
+- a call to one of FALDA's own MCP tools captures nothing
 - the always-exit-0 and empty-stdout invariants hold on every path
 
 New distiller coverage:
@@ -256,9 +304,8 @@ oversight.
 
 ## 9. Blast radius
 
-§4 and §5 modify `src/distill/core.ts`, `src/falda.ts` and
-`src/embedder.ts` — shared with the opencode integration and every other
-caller. Both are robustness fixes the repo wants independently of this
+§4 and §5 modify `src/distill/core.ts` and `src/falda.ts` — shared with the
+opencode integration and every other caller. Both are robustness fixes the repo wants independently of this
 feature: today a single large `falda_stream_add` row can fail an entire
 distillation pass or an entire ingest batch, with or without tool capture.
 
