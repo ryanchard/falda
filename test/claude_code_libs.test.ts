@@ -17,6 +17,7 @@ import { spawn } from "node:child_process";
 import * as mcp from "../integrations/claude-code/hooks/lib/mcp.mjs";
 import * as creds from "../integrations/claude-code/hooks/lib/creds.mjs";
 import * as state from "../integrations/claude-code/hooks/lib/state.mjs";
+import * as payload from "../integrations/claude-code/hooks/lib/payload.mjs";
 
 describe("cc plugin: mcp envelope parsing", () => {
   test("unwraps an SSE-framed JSON-RPC response", () => {
@@ -400,5 +401,69 @@ describe("cc plugin: documentation", () => {
       assert.ok(raw.includes("integrations/claude-code"),
         `${doc} must point at the Claude Code integration`);
     }
+  });
+});
+
+describe("cc plugin: payload serialization", () => {
+  test("passes a string through unchanged", () => {
+    assert.equal(payload.stringifyPayload("plain output"), "plain output");
+  });
+
+  test("serializes an object rather than yielding [object Object]", () => {
+    const out = payload.stringifyPayload({ stdout: "ok", interrupted: false });
+    assert.ok(out.includes('"stdout":"ok"'), `got: ${out}`);
+    assert.ok(!out.includes("[object Object]"));
+  });
+
+  test("maps null and undefined to the empty string", () => {
+    assert.equal(payload.stringifyPayload(null), "");
+    assert.equal(payload.stringifyPayload(undefined), "");
+  });
+
+  test("survives a circular object without throwing", () => {
+    const a: any = { name: "loop" };
+    a.self = a;
+    assert.equal(typeof payload.stringifyPayload(a), "string");
+  });
+});
+
+describe("cc plugin: truncateMiddle", () => {
+  test("leaves text at or under the budget untouched", () => {
+    assert.equal(payload.truncateMiddle("a".repeat(100), 100), "a".repeat(100));
+    assert.equal(payload.truncateMiddle("a".repeat(99), 100), "a".repeat(99));
+  });
+
+  test("keeps head 75% and tail 25% of the budget", () => {
+    const text = "H".repeat(500) + "M".repeat(9000) + "T".repeat(500);
+    const out = payload.truncateMiddle(text, 100);
+    assert.ok(out.startsWith("H".repeat(75)), "head is 75 chars");
+    assert.ok(out.endsWith("T".repeat(25)), "tail is 25 chars");
+  });
+
+  test("reports the true elided count in the marker", () => {
+    const out = payload.truncateMiddle("a".repeat(1000), 100);
+    const m = out.match(/\[(\d+) chars elided\]/);
+    assert.ok(m, `no elision marker in: ${out.slice(0, 120)}`);
+    assert.equal(Number(m![1]), 900, "1000 total - 75 head - 25 tail");
+  });
+
+  test("returns the empty string for a non-string input", () => {
+    assert.equal(payload.truncateMiddle(undefined, 100), "");
+  });
+});
+
+describe("cc plugin: toolMaxChars", () => {
+  test("defaults to 16384", () => {
+    assert.equal(payload.toolMaxChars({}), 16384);
+  });
+
+  test("honours a valid override", () => {
+    assert.equal(payload.toolMaxChars({ FALDA_CAPTURE_TOOL_MAX_CHARS: "512" }), 512);
+  });
+
+  test("falls back to the default on junk or non-positive values", () => {
+    assert.equal(payload.toolMaxChars({ FALDA_CAPTURE_TOOL_MAX_CHARS: "banana" }), 16384);
+    assert.equal(payload.toolMaxChars({ FALDA_CAPTURE_TOOL_MAX_CHARS: "0" }), 16384);
+    assert.equal(payload.toolMaxChars({ FALDA_CAPTURE_TOOL_MAX_CHARS: "-5" }), 16384);
   });
 });
