@@ -55,4 +55,56 @@ describe("cc plugin: login", () => {
     await startLogin({ clientId: "cid", stateDir: dir, open: async () => false, now: () => Date.now() - 11 * 60_000 });
     await assert.rejects(finishLogin("C", { stateDir: dir, clientId: "cid" }), /expired/);
   });
+  test("invalid JSON in the existing settings file fails before the code is spent: state file kept, no backup", async () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    fs.writeFileSync(settings, "{ not json");
+    await startLogin({ clientId: "cid", stateDir: dir, open: async () => false });
+    await assert.rejects(
+      finishLogin("CODE", { stateDir: dir, clientId: "cid", settingsPath: settings }),
+      (err: any) => {
+        assert.match(err.message, new RegExp(settings.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        return true;
+      },
+    );
+    assert.ok(fs.existsSync(path.join(dir, "login.json")), "state file kept for a retry");
+    const files = fs.readdirSync(dir);
+    assert.ok(!files.some((n) => n.includes(".bak-")), "no backup written");
+  });
+  test("writeClaudeSettings rejects invalid JSON directly, with the path in the message", () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    fs.writeFileSync(settings, "{ not json");
+    assert.throws(
+      () => writeClaudeSettings(settings, { url: "https://x/mcp", token: "t", tenant: "u" }),
+      (err: any) => { assert.match(err.message, /not valid JSON/); assert.ok(err.message.includes(settings)); return true; },
+    );
+  });
+  test("first run (no existing settings file) succeeds with no backup, file written 0600", async () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    const globus = await listen((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ id_token: "ID.TOKEN.X" })); }); });
+    const falda = await listen((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ api_key: "falda_new", tenant: "bob" })); }); });
+    try {
+      await startLogin({ clientId: "cid", stateDir: dir, open: async () => false });
+      const out = await finishLogin("CODE", { url: `${falda.url}/mcp`, clientId: "cid", stateDir: dir, tokenUrl: globus.url, settingsPath: settings });
+      assert.equal(out.backupPath, undefined);
+      assert.ok(fs.existsSync(settings));
+      assert.equal((fs.statSync(settings).mode & 0o777), 0o600);
+      const written = JSON.parse(fs.readFileSync(settings, "utf8"));
+      assert.equal(written.env.FALDA_TOKEN, "falda_new");
+    } finally { globus.close(); falda.close(); }
+  });
+  test("a symlinked settings file is preserved: the symlink stays, the real target is written", async () => {
+    const dir = tmp(); const real = path.join(dir, "real-settings.json"); const link = path.join(dir, "settings.json");
+    fs.writeFileSync(real, JSON.stringify({ env: { KEEP: "1" } }));
+    fs.symlinkSync(real, link);
+    const globus = await listen((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ id_token: "ID.TOKEN.X" })); }); });
+    const falda = await listen((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ api_key: "falda_link", tenant: "carol" })); }); });
+    try {
+      await startLogin({ clientId: "cid", stateDir: dir, open: async () => false });
+      await finishLogin("CODE", { url: `${falda.url}/mcp`, clientId: "cid", stateDir: dir, tokenUrl: globus.url, settingsPath: link });
+      assert.ok(fs.lstatSync(link).isSymbolicLink(), "symlink preserved");
+      assert.equal(fs.realpathSync(link), fs.realpathSync(real));
+      const written = JSON.parse(fs.readFileSync(real, "utf8"));
+      assert.deepEqual(written.env, { KEEP: "1", FALDA_MCP_URL: `${falda.url}/mcp`, FALDA_TOKEN: "falda_link", FALDA_TENANT: "carol" });
+    } finally { globus.close(); falda.close(); }
+  });
 });
