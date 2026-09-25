@@ -108,3 +108,20 @@ describe("cc plugin: login", () => {
     } finally { globus.close(); falda.close(); }
   });
 });
+
+describe("cc plugin: login — atomic write cleanup", () => {
+  test("a failed rename leaves no temp file behind", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-login-rn-"));
+    const settings = path.join(dir, "settings.json");
+    fs.writeFileSync(settings, JSON.stringify({ env: {} }));
+    // Make the directory read-only so the rename onto the target fails.
+    fs.chmodSync(dir, 0o500);
+    try {
+      assert.throws(() => writeClaudeSettings(settings, { url: "u", token: "falda_t", tenant: "x" }));
+    } finally {
+      fs.chmodSync(dir, 0o700);
+    }
+    const leftovers = fs.readdirSync(dir).filter((f) => f.includes(".tmp-"));
+    assert.deepEqual(leftovers, []);
+  });
+});
