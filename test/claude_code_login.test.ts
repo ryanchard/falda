@@ -7,7 +7,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import * as fs from "node:fs"; import * as os from "node:os"; import * as path from "node:path";
-import { startLogin, finishLogin, apiBase, writeClaudeSettings } from "../integrations/claude-code/hooks/lib/login.mjs";
+import { startLogin, finishLogin, apiBase, pickScopedToken, writeClaudeSettings } from "../integrations/claude-code/hooks/lib/login.mjs";
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), "cc-login-")); }
 /** A server that is not there: startLogin must fall back to the id_token scopes. */
@@ -216,6 +216,58 @@ describe("cc plugin: login — service scope from /auth/config", () => {
       await finishLogin("CODE", { url: `${falda.url}/mcp`, clientId: "cid", stateDir: dir, tokenUrl: globus.url, settingsPath: settings });
       assert.equal(loginReq.body.id_token, "ID.ONLY");
       assert.equal(loginReq.body.access_token, undefined);
+    } finally { globus.close(); falda.close(); }
+  });
+
+  test("the FALDA-scoped token is picked from other_tokens, not by position", async () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    let loginReq: any = null;
+    // Globus puts ONE resource server's token at the top level; which one
+    // depends on scope order, so position is not a contract.
+    const globus = await listen((_req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({
+      access_token: "AT.AUTH", scope: "openid profile email", id_token: "ID.TOKEN.X",
+      other_tokens: [
+        { access_token: "AT.GROUPS", scope: "urn:globus:auth:scope:groups.api.globus.org:view_my_groups_and_memberships" },
+        { access_token: "AT.FALDA", scope: SCOPE },
+      ],
+    })); });
+    const falda = await listen((req, res) => {
+      let b = ""; req.on("data", (c) => (b += c));
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/auth/config") { res.end(JSON.stringify({ login_client_id: "cid", service_scope: SCOPE })); return; }
+        loginReq = { body: JSON.parse(b) };
+        res.end(JSON.stringify({ api_key: "falda_abc", tenant: "alice" }));
+      });
+    });
+    try {
+      await startLogin({ clientId: "cid", stateDir: dir, open: async () => false, url: `${falda.url}/mcp` });
+      await finishLogin("CODE", { url: `${falda.url}/mcp`, clientId: "cid", stateDir: dir, tokenUrl: globus.url, settingsPath: settings });
+      assert.equal(loginReq.body.access_token, "AT.FALDA");
+    } finally { globus.close(); falda.close(); }
+  });
+
+  test("pickScopedToken falls back to the top-level token when nothing declares the scope", () => {
+    assert.equal(pickScopedToken({ access_token: "TOP", other_tokens: [{ access_token: "X", scope: "other" }] }, SCOPE), "TOP");
+    assert.equal(pickScopedToken({ access_token: "TOP" }, undefined), undefined, "no scope requested -> the id_token path");
+    // A decorated scope string ("*<scope>", dependent qualifiers) still matches.
+    assert.equal(pickScopedToken({ access_token: "TOP", scope: "openid", other_tokens: [{ access_token: "S", scope: `*${SCOPE}[groups]` }] }, SCOPE), "S");
+  });
+
+  test("a 401 on the scoped login tells the user to accept the FALDA consent", async () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    const globus = await listen((_req, res) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ access_token: "AT.FALDA", scope: SCOPE })); });
+    const falda = await listen((req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/auth/config") { res.end(JSON.stringify({ login_client_id: "cid", service_scope: SCOPE })); return; }
+      res.statusCode = 401; res.end(JSON.stringify({ error: "invalid_token", reason: "scope" }));
+    });
+    try {
+      await startLogin({ clientId: "cid", stateDir: dir, open: async () => false, url: `${falda.url}/mcp` });
+      await assert.rejects(
+        finishLogin("CODE", { url: `${falda.url}/mcp`, clientId: "cid", stateDir: dir, tokenUrl: globus.url, settingsPath: settings }),
+        /401.*invalid_token.*scope.*accept the FALDA consent/s,
+      );
     } finally { globus.close(); falda.close(); }
   });
 

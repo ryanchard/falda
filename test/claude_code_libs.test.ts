@@ -347,7 +347,11 @@ describe("cc plugin: packaging", () => {
     // silently disables it.
     assert.match(raw, /\$\{FALDA_MCP_URL:-http:\/\/localhost:8079\/mcp\}/);
     assert.match(raw, /\$\{FALDA_TOKEN\}/);
-    assert.match(raw, /\$\{FALDA_TENANT\}/);
+    // Tenant and pool carry an EMPTY default: an unset variable is left
+    // literally unexpanded by the harness, and a header reading
+    // "${FALDA_POOL}" would be taken by the server for a pool named that.
+    assert.match(raw, /\$\{FALDA_TENANT:-\}/);
+    assert.match(raw, /\$\{FALDA_POOL:-\}/);
     const cfg = JSON.parse(raw);
     assert.equal(cfg.mcpServers.falda.type, "http");
   });

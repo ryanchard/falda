@@ -88,6 +88,24 @@ describe("cc plugin: settings env writer", () => {
     assert.equal(fs.statSync(settings).mode & 0o777, 0o600);
   });
 
+  test("a delete-only patch against a missing file writes nothing", () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    const { changed, backupPath } = writeSettingsEnv(settings, { FALDA_POOL: null });
+    assert.equal(changed, false);
+    assert.equal(backupPath, undefined);
+    assert.equal(fs.existsSync(settings), false, "unbinding an unbound project creates no settings file");
+  });
+
+  test("a delete-only patch that removes nothing leaves the file and makes no backup", () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    fs.writeFileSync(settings, JSON.stringify({ env: { KEEP: "1" } }));
+    const before = fs.readFileSync(settings, "utf8");
+    const { changed } = writeSettingsEnv(settings, { FALDA_POOL: null });
+    assert.equal(changed, false);
+    assert.equal(fs.readFileSync(settings, "utf8"), before);
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".bak-")), []);
+  });
+
   test("invalid JSON is refused with the path in the message, file untouched", () => {
     const dir = tmp(); const settings = path.join(dir, "settings.json");
     fs.writeFileSync(settings, "{ not json");
@@ -206,6 +224,24 @@ describe("cc plugin: pool CLI", () => {
     assert.deepEqual(JSON.parse(fs.readFileSync(settings, "utf8")).env, { KEEP: "1" });
   });
 
+  test("--name takes the value verbatim, so a name needing shell quoting still binds", async () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    const s = await poolsServer([{ id: ALPHA, name: "Ryan's `group`", role: "member", kind: "group", access: "rw" }]);
+    try {
+      const r = await runCli(["--name", "Ryan's `group`", "--settings", settings], { FALDA_MCP_URL: `${s.url}/mcp`, FALDA_TOKEN: "falda_k", FALDA_TENANT: "alice" });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(JSON.parse(fs.readFileSync(settings, "utf8")).env.FALDA_POOL, ALPHA);
+    } finally { s.close(); }
+  });
+
+  test("--clear on a project that was never bound says so and creates nothing", async () => {
+    const dir = tmp(); const settings = path.join(dir, "settings.json");
+    const r = await runCli(["--clear", "--settings", settings], { FALDA_TOKEN: "falda_k", FALDA_TENANT: "alice" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /was not bound/);
+    assert.equal(fs.existsSync(settings), false);
+  });
+
   test("an ambiguous name exits non-zero listing both candidates, writing nothing", async () => {
     const dir = tmp(); const settings = path.join(dir, "settings.json");
     const s = await poolsServer([
@@ -224,5 +260,46 @@ describe("cc plugin: pool CLI", () => {
     const r = await runCli([], { FALDA_TOKEN: "", FALDA_TENANT: "" });
     assert.equal(r.code, 1);
     assert.match(r.stderr, /login/i);
+  });
+});
+
+describe("cc plugin: pool --current", () => {
+  test("names the bound group", async () => {
+    const s = await poolsServer([{ id: ALPHA, name: "Alpha", role: "member", kind: "group", access: "rw" }]);
+    try {
+      const r = await runCli(["--current"], { FALDA_MCP_URL: `${s.url}/mcp`, FALDA_TOKEN: "falda_k", FALDA_TENANT: "alice", FALDA_POOL: ALPHA });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout.trim(), `Bound to Alpha (${ALPHA})`);
+    } finally { s.close(); }
+  });
+
+  test("says so when the bound UUID is not among the user's groups", async () => {
+    const s = await poolsServer([{ id: BETA, name: "beta team", role: "admin", kind: "group", access: "rw" }]);
+    try {
+      const r = await runCli(["--current"], { FALDA_MCP_URL: `${s.url}/mcp`, FALDA_TOKEN: "falda_k", FALDA_TENANT: "alice", FALDA_POOL: ALPHA });
+      assert.equal(r.code, 0, r.stderr);
+      assert.match(r.stdout, new RegExp(`^Bound to ${ALPHA} — not in your groups`));
+    } finally { s.close(); }
+  });
+
+  test("an unset FALDA_POOL is 'not bound', with no server call", async () => {
+    const r = await runCli(["--current"], { FALDA_MCP_URL: "http://127.0.0.1:1/mcp", FALDA_TOKEN: "falda_k", FALDA_TENANT: "alice", FALDA_POOL: "" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^Not bound to a group/);
+  });
+
+  test("an unreachable server is reported as such, NOT as 'not a member'", async () => {
+    const r = await runCli(["--current"], { FALDA_MCP_URL: "http://127.0.0.1:1/mcp", FALDA_TOKEN: "falda_k", FALDA_TENANT: "alice", FALDA_POOL: ALPHA });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^Could not reach the server: /);
+    assert.ok(!r.stdout.includes("not in your groups"), "an outage must never look like a membership answer");
+    assert.ok(!r.stdout.includes("falda_k"));
+  });
+});
+
+describe("cc plugin: pool CLI is executable", () => {
+  test("hooks/pool.mjs has the executable bit, like the other hook entry points", () => {
+    const mode = fs.statSync(fileURLToPath(new URL("../integrations/claude-code/hooks/pool.mjs", import.meta.url))).mode;
+    assert.ok(mode & 0o111, "pool.mjs must be executable");
   });
 });
